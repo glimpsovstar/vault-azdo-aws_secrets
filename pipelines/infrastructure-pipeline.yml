@@ -43,17 +43,25 @@ jobs:
         inlineScript: |
           echo "Getting enhanced OIDC token via Azure Service Connection..."
 
-          # The AzureCLI task with WIF provides enhanced identity context
-          # Access token is available via AZURE_ACCESS_TOKEN environment variable
+          # Get the OIDC token using az account get-access-token with the audience for Azure DevOps
+          # This provides enhanced identity context compared to basic System.AccessToken
+          ENHANCED_TOKEN=$(az account get-access-token --resource-type ms-graph --query accessToken -o tsv)
+
+          if [ -z "$ENHANCED_TOKEN" ]; then
+            echo "Failed to get enhanced OIDC token, falling back to service principal token"
+            # Alternative: use the federated token directly
+            ENHANCED_TOKEN=$(az account get-access-token --query accessToken -o tsv)
+          fi
+
           echo "Enhanced OIDC token captured for debugging"
-          echo "$AZURE_ACCESS_TOKEN" > jwt-token.txt
+          echo "$ENHANCED_TOKEN" > jwt-token.txt
 
           echo "Authenticating with Vault using enhanced OIDC token..."
 
           # Authenticate with Vault using enhanced Azure OIDC token
           VAULT_TOKEN=$(vault write -field=token auth/azure-devops/login \
             role=pipeline-infra-role \
-            jwt="$AZURE_ACCESS_TOKEN")
+            jwt="$ENHANCED_TOKEN")
 
           if [ -z "$VAULT_TOKEN" ]; then
             echo "Failed to authenticate with Vault"

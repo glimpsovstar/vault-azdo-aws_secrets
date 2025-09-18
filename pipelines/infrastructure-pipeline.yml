@@ -86,47 +86,56 @@ jobs:
           echo "$ENHANCED_TOKEN" > jwt-token.txt
 
           echo "=== JWT Token Analysis ==="
-          # Save token parts for analysis
-          echo "$ENHANCED_TOKEN" | cut -d'.' -f1 > /tmp/header.b64
-          echo "$ENHANCED_TOKEN" | cut -d'.' -f2 > /tmp/payload.b64
-
           echo "Token length: ${#ENHANCED_TOKEN} characters"
           echo "Token parts: $(echo "$ENHANCED_TOKEN" | tr '.' '\n' | wc -l) parts"
 
-          # Decode JWT header and payload for analysis with proper padding
-          echo "Token Header:"
-          cat /tmp/header.b64 | python3 -c "
+          # Create a Python script for JWT decoding
+          cat > /tmp/decode_jwt.py << 'PYTHON_EOF'
 import base64, sys, json
-data = sys.stdin.read().strip()
-# Add padding if needed
-data += '=' * (-len(data) % 4)
-try:
-    decoded = base64.b64decode(data)
-    parsed = json.loads(decoded)
-    print(json.dumps(parsed, indent=2))
-except Exception as e:
-    print(f'Failed to decode header: {e}')
-"
 
-          echo "Token Payload:"
-          cat /tmp/payload.b64 | python3 -c "
-import base64, sys, json
-data = sys.stdin.read().strip()
-# Add padding if needed
-data += '=' * (-len(data) % 4)
-try:
-    decoded = base64.b64decode(data)
-    parsed = json.loads(decoded)
-    print(json.dumps(parsed, indent=2))
-except Exception as e:
-    print(f'Failed to decode payload: {e}')
-" > /tmp/payload.json
+def decode_jwt_part(data):
+    # Add padding if needed
+    data += '=' * (-len(data) % 4)
+    try:
+        decoded = base64.b64decode(data)
+        return json.loads(decoded)
+    except Exception as e:
+        return {"error": str(e)}
 
-          # Extract key claims for validation using Python
+# Read token from argument
+token = sys.argv[1] if len(sys.argv) > 1 else ""
+parts = token.split('.')
+
+if len(parts) >= 2:
+    header = decode_jwt_part(parts[0])
+    payload = decode_jwt_part(parts[1])
+
+    print("Token Header:")
+    print(json.dumps(header, indent=2))
+    print("\nToken Payload:")
+    print(json.dumps(payload, indent=2))
+
+    # Extract key claims
+    print(f"\nIssuer: {payload.get('iss', 'N/A')}")
+    print(f"Audience: {payload.get('aud', 'N/A')}")
+    print(f"Subject: {payload.get('sub', 'N/A')}")
+    print(f"Expires: {payload.get('exp', 'N/A')}")
+
+    # Save for later use
+    with open('/tmp/jwt_claims.json', 'w') as f:
+        json.dump(payload, f)
+else:
+    print("Invalid JWT format")
+PYTHON_EOF
+
+          # Decode the JWT token
+          python3 /tmp/decode_jwt.py "$ENHANCED_TOKEN"
+
+          # Extract claims for shell variables
           ISSUER=$(python3 -c "
 import json
 try:
-    with open('/tmp/payload.json', 'r') as f:
+    with open('/tmp/jwt_claims.json', 'r') as f:
         data = json.load(f)
     print(data.get('iss', 'N/A'))
 except: print('N/A')
@@ -134,7 +143,7 @@ except: print('N/A')
           AUDIENCE=$(python3 -c "
 import json
 try:
-    with open('/tmp/payload.json', 'r') as f:
+    with open('/tmp/jwt_claims.json', 'r') as f:
         data = json.load(f)
     print(data.get('aud', 'N/A'))
 except: print('N/A')
@@ -142,7 +151,7 @@ except: print('N/A')
           SUBJECT=$(python3 -c "
 import json
 try:
-    with open('/tmp/payload.json', 'r') as f:
+    with open('/tmp/jwt_claims.json', 'r') as f:
         data = json.load(f)
     print(data.get('sub', 'N/A'))
 except: print('N/A')
@@ -150,7 +159,7 @@ except: print('N/A')
           EXPIRES=$(python3 -c "
 import json
 try:
-    with open('/tmp/payload.json', 'r') as f:
+    with open('/tmp/jwt_claims.json', 'r') as f:
         data = json.load(f)
     print(data.get('exp', 'N/A'))
 except: print('N/A')

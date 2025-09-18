@@ -29,6 +29,33 @@ jobs:
           echo "$AZURE_ACCESS_TOKEN" > jwt-token.txt
           echo "JWT token saved for debugging"
 
+          echo "=== JWT Token Analysis ==="
+          # Decode JWT header and payload for analysis
+          echo "Token Header:"
+          echo "$AZURE_ACCESS_TOKEN" | cut -d'.' -f1 | base64 -d 2>/dev/null | jq '.' || echo "Failed to decode header"
+
+          echo "Token Payload:"
+          echo "$AZURE_ACCESS_TOKEN" | cut -d'.' -f2 | base64 -d 2>/dev/null | jq '.' || echo "Failed to decode payload"
+
+          # Extract key claims for validation
+          ISSUER=$(echo "$AZURE_ACCESS_TOKEN" | cut -d'.' -f2 | base64 -d 2>/dev/null | jq -r '.iss')
+          AUDIENCE=$(echo "$AZURE_ACCESS_TOKEN" | cut -d'.' -f2 | base64 -d 2>/dev/null | jq -r '.aud')
+          SUBJECT=$(echo "$AZURE_ACCESS_TOKEN" | cut -d'.' -f2 | base64 -d 2>/dev/null | jq -r '.sub // "N/A"')
+          EXPIRES=$(echo "$AZURE_ACCESS_TOKEN" | cut -d'.' -f2 | base64 -d 2>/dev/null | jq -r '.exp')
+
+          echo "Key Claims Analysis:"
+          echo "  Issuer: $ISSUER"
+          echo "  Audience: $AUDIENCE"
+          echo "  Subject: $SUBJECT"
+          echo "  Expires: $EXPIRES ($(date -r $EXPIRES 2>/dev/null || echo 'Invalid timestamp'))"
+
+          # Check token type
+          if [[ "$AUDIENCE" == *"vso:"* ]]; then
+            echo "✅ Enhanced WIF token detected (contains Azure DevOps organization ID)"
+          else
+            echo "⚠️  Basic Azure DevOps token detected"
+          fi
+
     - task: Bash@3
       displayName: 'Authenticate with Vault using JWT'
       env:

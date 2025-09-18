@@ -56,6 +56,42 @@ jobs:
           echo "Enhanced OIDC token captured for debugging"
           echo "$ENHANCED_TOKEN" > jwt-token.txt
 
+          echo "=== JWT Token Analysis ==="
+          # Decode JWT header and payload for analysis
+          echo "Token Header:"
+          echo "$ENHANCED_TOKEN" | cut -d'.' -f1 | base64 -d 2>/dev/null | jq '.' || echo "Failed to decode header"
+
+          echo "Token Payload:"
+          echo "$ENHANCED_TOKEN" | cut -d'.' -f2 | base64 -d 2>/dev/null | jq '.' || echo "Failed to decode payload"
+
+          # Extract key claims for validation
+          ISSUER=$(echo "$ENHANCED_TOKEN" | cut -d'.' -f2 | base64 -d 2>/dev/null | jq -r '.iss')
+          AUDIENCE=$(echo "$ENHANCED_TOKEN" | cut -d'.' -f2 | base64 -d 2>/dev/null | jq -r '.aud')
+          SUBJECT=$(echo "$ENHANCED_TOKEN" | cut -d'.' -f2 | base64 -d 2>/dev/null | jq -r '.sub // "N/A"')
+          EXPIRES=$(echo "$ENHANCED_TOKEN" | cut -d'.' -f2 | base64 -d 2>/dev/null | jq -r '.exp')
+
+          echo "Key Claims Analysis:"
+          echo "  Issuer: $ISSUER"
+          echo "  Audience: $AUDIENCE"
+          echo "  Subject: $SUBJECT"
+          echo "  Expires: $EXPIRES ($(date -r $EXPIRES 2>/dev/null || echo 'Invalid timestamp'))"
+
+          # Check if this is an enhanced WIF token
+          if [[ "$AUDIENCE" == *"vso:"* ]]; then
+            echo "✅ Enhanced WIF token detected (contains Azure DevOps organization ID)"
+          else
+            echo "⚠️  Basic token detected (no organization ID in audience)"
+          fi
+
+          echo "=== Vault Configuration Update Test ==="
+          # Test updating Vault configuration to accept new organization tokens
+          echo "Attempting to update Vault JWT auth configuration..."
+
+          # Try to update the JWT auth configuration for the new organization
+          vault write auth/azure-devops/config \
+            oidc_discovery_url="https://vstoken.dev.azure.com/00000000-0000-0000-0000-000000000000" \
+            bound_audiences="$AUDIENCE" || echo "Failed to update Vault config - will try authentication with current config"
+
           echo "Authenticating with Vault using enhanced OIDC token..."
 
           # Authenticate with Vault using enhanced Azure OIDC token

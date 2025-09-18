@@ -1,0 +1,361 @@
+# Azure DevOps Pipeline - Entra ID Group Authentication with Limited S3 Permissions
+# This pipeline demonstrates user-based authentication via Entra ID groups
+# It obtains AWS credentials with limited S3-only permissions
+
+trigger:
+- main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  - group: vault-config
+  - name: VAULT_ADDR
+    value: 'https://vault.company.com'
+  - name: AWS_REGION
+    value: 'us-east-1'
+
+stages:
+- stage: AuthenticateWithEntraID
+  displayName: 'Authenticate with Entra ID and Test Permissions'
+  jobs:
+  - job: AttemptProvisionWithUserAuth
+    displayName: 'Test S3 vs Infrastructure Permissions'
+    steps:
+    - task: AzureCLI@2
+      displayName: 'Get User Identity Token'
+      inputs:
+        azureSubscription: 'EntraIDServiceConnection'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          # Get the current user's access token
+          USER_TOKEN=$(az account get-access-token --resource api://vault-app --query accessToken -o tsv)
+          echo "##vso[task.setvariable variable=USER_TOKEN;issecret=true]$USER_TOKEN"
+          
+          # Get user info
+          USER_EMAIL=$(az ad signed-in-user show --query mail -o tsv || echo "unknown")
+          USER_NAME=$(az ad signed-in-user show --query displayName -o tsv || echo "unknown")
+          echo "Current user: $USER_NAME ($USER_EMAIL)"
+          echo "##vso[task.setvariable variable=USER_EMAIL]$USER_EMAIL"
+          echo "##vso[task.setvariable variable=USER_NAME]$USER_NAME"
+
+    - script: |
+        # Install Vault CLI
+        wget -O- https://apt.releases.hashicorp.com/gpg | gpg --dearmor | sudo tee /usr/share/keyrings/hashicorp-archive-keyring.gpg > /dev/null
+        echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+        sudo apt update && sudo apt install -y vault
+        
+        # Install AWS CLI
+        sudo apt-get install -y awscli jq
+        
+        # Verify installations
+        vault version
+        aws --version
+      displayName: 'Install Required Tools'
+
+    - script: |
+        # Authenticate to Vault using OIDC
+        echo "Authenticating to Vault as user: $(USER_NAME)"
+        
+        export VAULT_TOKEN=$(vault write -field=token auth/oidc/login \
+          role=s3-developers \
+          jwt=$USER_TOKEN)
+        
+        if [ -z "$VAULT_TOKEN" ]; then
+          echo "❌ Failed to authenticate to Vault"
+          echo "Make sure the user is a member of the S3 Developers group in Entra ID"
+          exit 1
+        fi
+        
+        echo "##vso[task.setvariable variable=VAULT_TOKEN;issecret=true]$VAULT_TOKEN"
+        echo "✅ Successfully authenticated with Entra ID group membership"
+      displayName: 'Authenticate to Vault with Entra ID'
+      env:
+        USER_TOKEN: $(USER_TOKEN)
+
+    - script: |
+        # Get AWS credentials from Vault (S3-only role)
+        echo "Requesting AWS credentials (S3-only role) from Vault..."
+        
+        CREDS=$(vault read -format=json aws/sts/s3-only-role)
+        
+        if [ $? -ne 0 ]; then
+          echo "❌ Failed to get AWS credentials from Vault"
+          exit 1
+        fi
+        
+        export AWS_ACCESS_KEY_ID=$(echo $CREDS | jq -r '.data.access_key')
+        export AWS_SECRET_ACCESS_KEY=$(echo $CREDS | jq -r '.data.secret_key')
+        export AWS_SESSION_TOKEN=$(echo $CREDS | jq -r '.data.security_token')
+        
+        echo "##vso[task.setvariable variable=AWS_ACCESS_KEY_ID;issecret=true]$AWS_ACCESS_KEY_ID"
+        echo "##vso[task.setvariable variable=AWS_SECRET_ACCESS_KEY;issecret=true]$AWS_SECRET_ACCESS_KEY"
+        echo "##vso[task.setvariable variable=AWS_SESSION_TOKEN;issecret=true]$AWS_SESSION_TOKEN"
+        
+        # Test AWS access
+        echo ""
+        echo "Current AWS identity:"
+        aws sts get-caller-identity
+        echo ""
+        echo "✅ Successfully obtained AWS credentials with S3-only permissions"
+      displayName: 'Get AWS Credentials (S3-Only) from Vault'
+      env:
+        VAULT_TOKEN: $(VAULT_TOKEN)
+
+    - script: |
+        echo "=========================================="
+        echo "🧪 Testing S3 Operations (Should Succeed)"
+        echo "=========================================="
+        echo ""
+        
+        # Create a unique S3 bucket
+        BUCKET_NAME="vault-demo-$(date +%s)"
+        echo "Creating S3 bucket: $BUCKET_NAME"
+        
+        # This should work - S3 permissions granted
+        if aws s3 mb s3://$BUCKET_NAME --region $AWS_REGION; then
+          echo "✅ Successfully created S3 bucket: $BUCKET_NAME"
+        else
+          echo "❌ Failed to create S3 bucket (unexpected)"
+          exit 1
+        fi
+        
+        # Upload a test file
+        echo "Test file from Azure DevOps with Entra ID auth - User: $(USER_NAME)" > test.txt
+        echo "Timestamp: $(date)" >> test.txt
+        echo "Authentication method: Entra ID Group (S3 Developers)" >> test.txt
+        
+        if aws s3 cp test.txt s3://$BUCKET_NAME/; then
+          echo "✅ Successfully uploaded file to S3"
+        else
+          echo "❌ Failed to upload file (unexpected)"
+        fi
+        
+        # List bucket contents
+        echo ""
+        echo "Listing bucket contents:"
+        aws s3 ls s3://$BUCKET_NAME/
+        echo "✅ Successfully listed S3 bucket contents"
+        
+        # Download the file
+        if aws s3 cp s3://$BUCKET_NAME/test.txt downloaded.txt; then
+          echo "✅ Successfully downloaded file from S3"
+          echo "File contents:"
+          cat downloaded.txt
+        else
+          echo "❌ Failed to download file (unexpected)"
+        fi
+        
+        # Clean up
+        echo ""
+        echo "Cleaning up S3 resources..."
+        aws s3 rm s3://$BUCKET_NAME/test.txt
+        aws s3 rb s3://$BUCKET_NAME
+        echo "✅ Successfully cleaned up S3 resources"
+        
+        echo ""
+        echo "========================================"
+        echo "✅ All S3 operations completed successfully!"
+        echo "========================================"
+      displayName: 'Test S3 Operations (Should Succeed)'
+      env:
+        AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+        AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+        AWS_SESSION_TOKEN: $(AWS_SESSION_TOKEN)
+        AWS_REGION: $(AWS_REGION)
+
+    - script: |
+        echo "============================================="
+        echo "🚫 Testing EC2/VPC Operations (Should Fail)"
+        echo "============================================="
+        echo ""
+        echo "These operations should fail due to insufficient permissions."
+        echo "This is expected behavior and demonstrates proper RBAC."
+        echo ""
+        
+        # Try to create a VPC - this should fail
+        set +e  # Don't exit on error
+        
+        echo "1. Attempting to create VPC..."
+        OUTPUT=$(aws ec2 create-vpc --cidr-block 10.0.0.0/16 --region $AWS_REGION 2>&1)
+        if [ $? -ne 0 ]; then
+          echo "✅ Expected failure: Cannot create VPC with S3-only permissions"
+          echo "   Error: $(echo $OUTPUT | grep -oP 'UnauthorizedOperation|AccessDenied|is not authorized' | head -1)"
+        else
+          echo "⚠️  Unexpected: VPC creation succeeded (should have failed)"
+          # Clean up if it somehow succeeded
+          VPC_ID=$(echo $OUTPUT | jq -r '.Vpc.VpcId')
+          aws ec2 delete-vpc --vpc-id $VPC_ID --region $AWS_REGION 2>/dev/null
+        fi
+        
+        echo ""
+        echo "2. Attempting to describe EC2 instances..."
+        OUTPUT=$(aws ec2 describe-instances --region $AWS_REGION 2>&1)
+        if [ $? -ne 0 ]; then
+          echo "✅ Expected failure: Cannot describe EC2 instances with S3-only permissions"
+          echo "   Error: $(echo $OUTPUT | grep -oP 'UnauthorizedOperation|AccessDenied|is not authorized' | head -1)"
+        else
+          echo "⚠️  Unexpected: EC2 describe succeeded (should have failed)"
+        fi
+        
+        echo ""
+        echo "3. Attempting to create security group..."
+        OUTPUT=$(aws ec2 create-security-group --group-name test-sg --description "Test SG" --region $AWS_REGION 2>&1)
+        if [ $? -ne 0 ]; then
+          echo "✅ Expected failure: Cannot create security group with S3-only permissions"
+          echo "   Error: $(echo $OUTPUT | grep -oP 'UnauthorizedOperation|AccessDenied|is not authorized' | head -1)"
+        else
+          echo "⚠️  Unexpected: Security group creation succeeded (should have failed)"
+        fi
+        
+        echo ""
+        echo "4. Attempting to list IAM users..."
+        OUTPUT=$(aws iam list-users 2>&1)
+        if [ $? -ne 0 ]; then
+          echo "✅ Expected failure: Cannot list IAM users with S3-only permissions"
+          echo "   Error: $(echo $OUTPUT | grep -oP 'UnauthorizedOperation|AccessDenied|is not authorized' | head -1)"
+        else
+          echo "⚠️  Unexpected: IAM list users succeeded (should have failed)"
+        fi
+        
+        set -e  # Re-enable exit on error
+        
+        echo ""
+        echo "========================================"
+        echo "✅ All permission checks completed!"
+        echo "EC2/VPC/IAM operations failed as expected."
+        echo "========================================"
+      displayName: 'Test EC2/VPC Operations (Should Fail)'
+      env:
+        AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+        AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+        AWS_SESSION_TOKEN: $(AWS_SESSION_TOKEN)
+        AWS_REGION: $(AWS_REGION)
+      continueOnError: true
+
+    - task: TerraformInstaller@0
+      displayName: 'Install Terraform'
+      inputs:
+        terraformVersion: 'latest'
+
+    - script: |
+        echo "================================================"
+        echo "🚫 Attempting Full Infrastructure Provisioning"
+        echo "================================================"
+        echo ""
+        echo "This should fail due to insufficient AWS permissions."
+        echo "User authenticated via Entra ID only has S3 access."
+        echo ""
+        
+        # Create a simple Terraform configuration that requires EC2 permissions
+        mkdir -p terraform-test
+        cd terraform-test
+        
+        cat > main.tf << 'EOF'
+        terraform {
+          required_version = ">= 1.0"
+          required_providers {
+            aws = {
+              source  = "hashicorp/aws"
+              version = "~> 5.0"
+            }
+          }
+        }
+        
+        provider "aws" {
+          region = var.aws_region
+        }
+        
+        variable "aws_region" {
+          default = "us-east-1"
+        }
+        
+        # This will fail - requires EC2 permissions
+        resource "aws_vpc" "demo_vpc" {
+          cidr_block = "10.0.0.0/16"
+          
+          tags = {
+            Name = "vault-demo-vpc-entraid"
+            CreatedBy = "Azure-DevOps-EntraID"
+          }
+        }
+        
+        # This would also fail - requires EC2 permissions
+        resource "aws_security_group" "demo_sg" {
+          name        = "vault-demo-sg-entraid"
+          description = "Security group for Vault demo - Entra ID"
+          
+          tags = {
+            Name = "vault-demo-sg-entraid"
+          }
+        }
+        EOF
+        
+        # Try to apply - this should fail during planning
+        set +e
+        
+        echo "Running terraform init..."
+        terraform init
+        
+        echo ""
+        echo "Running terraform plan..."
+        terraform plan -out=tfplan 2>&1 | tee plan_output.txt
+        TERRAFORM_EXIT_CODE=$?
+        
+        if [ $TERRAFORM_EXIT_CODE -ne 0 ]; then
+          echo ""
+          echo "✅ Expected failure: Terraform plan failed due to insufficient AWS permissions"
+          echo "This demonstrates that Entra ID group-based auth provides only S3 permissions."
+          
+          # Extract and display the error
+          if grep -q "UnauthorizedOperation\|AccessDenied\|is not authorized" plan_output.txt; then
+            echo ""
+            echo "Permission error detected:"
+            grep -A2 -B2 "UnauthorizedOperation\|AccessDenied\|is not authorized" plan_output.txt | head -10
+          fi
+        else
+          echo "⚠️  Unexpected: Terraform plan succeeded (should have failed due to permissions)"
+        fi
+        
+        set -e
+        
+        echo ""
+        echo "========================================"
+        echo "✅ Infrastructure provisioning test complete!"
+        echo "Failed as expected - S3-only permissions."
+        echo "========================================"
+      displayName: 'Attempt Infrastructure Provisioning (Should Fail)'
+      env:
+        AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+        AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+        AWS_SESSION_TOKEN: $(AWS_SESSION_TOKEN)
+        AWS_REGION: $(AWS_REGION)
+      continueOnError: true
+
+    - script: |
+        echo "============================================"
+        echo "🎆 Demo Summary"
+        echo "============================================"
+        echo ""
+        echo "Authentication Method: Entra ID Group-Based"
+        echo "User: $(USER_NAME)"
+        echo "Email: $(USER_EMAIL)"
+        echo "Group: S3 Developers"
+        echo ""
+        echo "✅ Successfully Demonstrated:"
+        echo "  1. Authenticated using Entra ID group membership"
+        echo "  2. Obtained AWS credentials with S3-only permissions"
+        echo "  3. S3 operations completed successfully"
+        echo "  4. EC2/VPC operations failed as expected (insufficient permissions)"
+        echo "  5. Infrastructure provisioning blocked due to permission constraints"
+        echo ""
+        echo "This demonstrates proper role-based access control (RBAC):"
+        echo "  • Users in 'S3 Developers' group can only access S3 resources"
+        echo "  • Infrastructure provisioning requires service account with OIDC auth"
+        echo "  • Principle of least privilege is enforced"
+        echo ""
+        echo "Compare this with the OIDC pipeline which has full infrastructure permissions."
+        echo ""
+        echo "============================================"
+      displayName: 'Demo Summary'

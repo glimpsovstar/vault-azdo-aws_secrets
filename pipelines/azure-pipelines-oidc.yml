@@ -1,0 +1,369 @@
+# Azure DevOps Pipeline - OIDC Authentication with Full Infrastructure Permissions
+# This pipeline demonstrates service-to-service authentication using JWT/OIDC
+# It obtains AWS credentials with broad permissions for infrastructure provisioning
+
+trigger:
+- main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  - group: vault-config
+  - name: VAULT_ADDR
+    value: 'https://vault.company.com'
+  - name: AWS_REGION
+    value: 'us-east-1'
+
+stages:
+- stage: AuthenticateAndProvision
+  displayName: 'Authenticate and Provision Infrastructure'
+  jobs:
+  - job: ProvisionInfrastructure
+    displayName: 'Provision AWS Infrastructure'
+    steps:
+    - task: AzureCLI@2
+      displayName: 'Get Azure DevOps JWT Token'
+      inputs:
+        azureSubscription: 'VaultServiceConnection'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          # Get the ID token from Azure DevOps
+          ID_TOKEN=$(echo $SYSTEM_ACCESSTOKEN | base64 -d)
+          echo "##vso[task.setvariable variable=ID_TOKEN;issecret=true]$ID_TOKEN"
+      env:
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+    - script: |
+        # Install Vault CLI
+        wget -O- https://apt.releases.hashicorp.com/gpg | gpg --dearmor | sudo tee /usr/share/keyrings/hashicorp-archive-keyring.gpg > /dev/null
+        echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+        sudo apt update && sudo apt install -y vault
+        
+        # Verify Vault installation
+        vault version
+      displayName: 'Install Vault CLI'
+
+    - script: |
+        # Authenticate to Vault using JWT
+        echo "Authenticating to Vault at $VAULT_ADDR"
+        
+        export VAULT_TOKEN=$(vault write -field=token auth/azure-devops/login \
+          role=pipeline-infra-role \
+          jwt=$ID_TOKEN)
+        
+        if [ -z "$VAULT_TOKEN" ]; then
+          echo "Failed to authenticate to Vault"
+          exit 1
+        fi
+        
+        echo "##vso[task.setvariable variable=VAULT_TOKEN;issecret=true]$VAULT_TOKEN"
+        echo "Successfully authenticated to Vault"
+      displayName: 'Authenticate to Vault'
+      env:
+        ID_TOKEN: $(ID_TOKEN)
+
+    - script: |
+        # Get AWS credentials from Vault
+        echo "Requesting AWS credentials from Vault..."
+        
+        CREDS=$(vault read -format=json aws/sts/infrastructure-role)
+        
+        if [ $? -ne 0 ]; then
+          echo "Failed to get AWS credentials from Vault"
+          exit 1
+        fi
+        
+        export AWS_ACCESS_KEY_ID=$(echo $CREDS | jq -r '.data.access_key')
+        export AWS_SECRET_ACCESS_KEY=$(echo $CREDS | jq -r '.data.secret_key')
+        export AWS_SESSION_TOKEN=$(echo $CREDS | jq -r '.data.security_token')
+        
+        echo "##vso[task.setvariable variable=AWS_ACCESS_KEY_ID;issecret=true]$AWS_ACCESS_KEY_ID"
+        echo "##vso[task.setvariable variable=AWS_SECRET_ACCESS_KEY;issecret=true]$AWS_SECRET_ACCESS_KEY"
+        echo "##vso[task.setvariable variable=AWS_SESSION_TOKEN;issecret=true]$AWS_SESSION_TOKEN"
+        
+        # Test AWS access
+        echo "Testing AWS credentials..."
+        aws sts get-caller-identity
+        
+        echo "Successfully obtained AWS credentials with infrastructure permissions"
+      displayName: 'Get AWS Credentials from Vault'
+      env:
+        VAULT_TOKEN: $(VAULT_TOKEN)
+
+    - task: TerraformInstaller@0
+      displayName: 'Install Terraform'
+      inputs:
+        terraformVersion: 'latest'
+
+    - script: |
+        # Create Terraform configuration for demo infrastructure
+        mkdir -p terraform-demo
+        cd terraform-demo
+        
+        cat > main.tf << 'EOF'
+        terraform {
+          required_version = ">= 1.0"
+          required_providers {
+            aws = {
+              source  = "hashicorp/aws"
+              version = "~> 5.0"
+            }
+          }
+        }
+        
+        provider "aws" {
+          region = var.aws_region
+        }
+        
+        variable "aws_region" {
+          default = "us-east-1"
+        }
+        
+        # Create VPC
+        resource "aws_vpc" "demo_vpc" {
+          cidr_block           = "10.0.0.0/16"
+          enable_dns_hostnames = true
+          enable_dns_support   = true
+          
+          tags = {
+            Name        = "vault-demo-vpc"
+            CreatedBy   = "Azure-DevOps-OIDC"
+            Environment = "demo"
+            Timestamp   = timestamp()
+          }
+        }
+        
+        # Create public subnet
+        resource "aws_subnet" "demo_subnet" {
+          vpc_id                  = aws_vpc.demo_vpc.id
+          cidr_block              = "10.0.1.0/24"
+          availability_zone       = data.aws_availability_zones.available.names[0]
+          map_public_ip_on_launch = true
+          
+          tags = {
+            Name = "vault-demo-subnet"
+            Type = "public"
+          }
+        }
+        
+        # Create Internet Gateway
+        resource "aws_internet_gateway" "demo_igw" {
+          vpc_id = aws_vpc.demo_vpc.id
+          
+          tags = {
+            Name = "vault-demo-igw"
+          }
+        }
+        
+        # Create route table
+        resource "aws_route_table" "demo_rt" {
+          vpc_id = aws_vpc.demo_vpc.id
+          
+          route {
+            cidr_block = "0.0.0.0/0"
+            gateway_id = aws_internet_gateway.demo_igw.id
+          }
+          
+          tags = {
+            Name = "vault-demo-route-table"
+          }
+        }
+        
+        # Associate route table with subnet
+        resource "aws_route_table_association" "demo_rta" {
+          subnet_id      = aws_subnet.demo_subnet.id
+          route_table_id = aws_route_table.demo_rt.id
+        }
+        
+        # Create security group
+        resource "aws_security_group" "demo_sg" {
+          name        = "vault-demo-sg"
+          description = "Security group for Vault demo"
+          vpc_id      = aws_vpc.demo_vpc.id
+          
+          ingress {
+            description = "SSH from anywhere"
+            from_port   = 22
+            to_port     = 22
+            protocol    = "tcp"
+            cidr_blocks = ["0.0.0.0/0"]
+          }
+          
+          ingress {
+            description = "HTTP from anywhere"
+            from_port   = 80
+            to_port     = 80
+            protocol    = "tcp"
+            cidr_blocks = ["0.0.0.0/0"]
+          }
+          
+          ingress {
+            description = "HTTPS from anywhere"
+            from_port   = 443
+            to_port     = 443
+            protocol    = "tcp"
+            cidr_blocks = ["0.0.0.0/0"]
+          }
+          
+          egress {
+            description = "All outbound traffic"
+            from_port   = 0
+            to_port     = 0
+            protocol    = "-1"
+            cidr_blocks = ["0.0.0.0/0"]
+          }
+          
+          tags = {
+            Name = "vault-demo-sg"
+          }
+        }
+        
+        # Data source for availability zones
+        data "aws_availability_zones" "available" {
+          state = "available"
+        }
+        
+        # Data source for latest Amazon Linux 2 AMI
+        data "aws_ami" "amazon_linux" {
+          most_recent = true
+          owners      = ["amazon"]
+          
+          filter {
+            name   = "name"
+            values = ["amzn2-ami-hvm-*-x86_64-gp2"]
+          }
+          
+          filter {
+            name   = "virtualization-type"
+            values = ["hvm"]
+          }
+        }
+        
+        # Create EC2 instance
+        resource "aws_instance" "demo_instance" {
+          ami                    = data.aws_ami.amazon_linux.id
+          instance_type          = "t2.micro"
+          subnet_id              = aws_subnet.demo_subnet.id
+          vpc_security_group_ids = [aws_security_group.demo_sg.id]
+          
+          user_data = <<-EOF
+            #!/bin/bash
+            yum update -y
+            yum install -y httpd
+            systemctl start httpd
+            systemctl enable httpd
+            
+            # Create demo web page
+            cat > /var/www/html/index.html <<HTML
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Vault Demo - Azure DevOps OIDC</title>
+                <style>
+                    body {
+                        font-family: Arial, sans-serif;
+                        max-width: 800px;
+                        margin: 50px auto;
+                        padding: 20px;
+                        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                        color: white;
+                    }
+                    .container {
+                        background: rgba(255,255,255,0.1);
+                        padding: 30px;
+                        border-radius: 10px;
+                        box-shadow: 0 8px 32px 0 rgba(31, 38, 135, 0.37);
+                    }
+                    h1 { color: #fff; }
+                    .info { background: rgba(255,255,255,0.2); padding: 15px; border-radius: 5px; margin: 10px 0; }
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h1>🔐 Vault + Azure DevOps Demo</h1>
+                    <div class="info">
+                        <h2>Authentication Method: OIDC/JWT</h2>
+                        <p>This instance was provisioned using Azure DevOps with HashiCorp Vault integration.</p>
+                    </div>
+                    <div class="info">
+                        <h3>Key Features Demonstrated:</h3>
+                        <ul>
+                            <li>Service-to-service authentication via OIDC</li>
+                            <li>Dynamic AWS credentials from Vault</li>
+                            <li>Full infrastructure provisioning capabilities</li>
+                            <li>Zero static credentials in pipeline</li>
+                        </ul>
+                    </div>
+                    <div class="info">
+                        <p><strong>Instance ID:</strong> $(curl -s http://169.254.169.254/latest/meta-data/instance-id)</p>
+                        <p><strong>Region:</strong> $(curl -s http://169.254.169.254/latest/meta-data/placement/region)</p>
+                        <p><strong>Created:</strong> $(date)</p>
+                    </div>
+                </div>
+            </body>
+            </html>
+            HTML
+          EOF
+          
+          tags = {
+            Name        = "vault-demo-instance"
+            CreatedBy   = "Azure-DevOps-OIDC"
+            Purpose     = "Demo infrastructure provisioning with Vault"
+            Environment = "demo"
+          }
+        }
+        
+        # Outputs
+        output "instance_public_ip" {
+          value       = aws_instance.demo_instance.public_ip
+          description = "Public IP of the demo instance"
+        }
+        
+        output "instance_public_dns" {
+          value       = aws_instance.demo_instance.public_dns
+          description = "Public DNS of the demo instance"
+        }
+        
+        output "vpc_id" {
+          value       = aws_vpc.demo_vpc.id
+          description = "ID of the created VPC"
+        }
+        
+        output "demo_url" {
+          value       = "http://${aws_instance.demo_instance.public_ip}"
+          description = "URL to access the demo application"
+        }
+        EOF
+        
+        # Initialize and apply Terraform
+        terraform init
+        terraform plan -out=tfplan
+        terraform apply tfplan
+        
+        # Display outputs
+        echo ""
+        echo "========================================"
+        echo "Infrastructure provisioning complete!"
+        echo "========================================"
+        terraform output -json | jq .
+      displayName: 'Provision AWS Infrastructure with Terraform'
+      env:
+        AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+        AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+        AWS_SESSION_TOKEN: $(AWS_SESSION_TOKEN)
+        AWS_REGION: $(AWS_REGION)
+
+    - script: |
+        echo "✅ Successfully demonstrated OIDC authentication with full infrastructure provisioning!"
+        echo ""
+        echo "Key achievements:"
+        echo "1. Authenticated to Vault using Azure DevOps OIDC token"
+        echo "2. Retrieved AWS credentials with infrastructure-level permissions"
+        echo "3. Provisioned VPC, subnet, security group, and EC2 instance"
+        echo "4. No static credentials were used in this pipeline"
+        echo ""
+        echo "The infrastructure will remain for demonstration purposes."
+        echo "To clean up, run: terraform destroy"
+      displayName: 'Summary'

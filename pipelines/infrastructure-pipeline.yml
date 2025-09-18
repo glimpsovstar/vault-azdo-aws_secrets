@@ -42,33 +42,119 @@ jobs:
         scriptLocation: 'inlineScript'
         inlineScript: |
           echo "Getting enhanced OIDC token via Azure Service Connection..."
+          echo "Service Principal Details:"
+          echo "  ARM_CLIENT_ID: ${ARM_CLIENT_ID:-Not set}"
+          echo "  ARM_TENANT_ID: ${ARM_TENANT_ID:-Not set}"
+          echo "  ARM_SUBSCRIPTION_ID: ${ARM_SUBSCRIPTION_ID:-Not set}"
+          echo "  ARM_USE_OIDC: ${ARM_USE_OIDC:-Not set}"
+          echo "  AZURE_FEDERATED_TOKEN_FILE: ${AZURE_FEDERATED_TOKEN_FILE:-Not set}"
 
-          # Get the OIDC token using az account get-access-token with the audience for Azure DevOps
-          # This provides enhanced identity context compared to basic System.AccessToken
-          ENHANCED_TOKEN=$(az account get-access-token --resource-type ms-graph --query accessToken -o tsv)
+          # Try different approaches to get enhanced token
+          echo "Attempting multiple token acquisition methods..."
+
+          # Method 1: Try to get Azure DevOps specific token
+          echo "Method 1: Azure DevOps resource token"
+          ENHANCED_TOKEN=$(az account get-access-token --resource 499b84ac-1321-427f-aa17-267ca6975798 --query accessToken -o tsv 2>/dev/null || echo "")
 
           if [ -z "$ENHANCED_TOKEN" ]; then
-            echo "Failed to get enhanced OIDC token, falling back to service principal token"
-            # Alternative: use the federated token directly
-            ENHANCED_TOKEN=$(az account get-access-token --query accessToken -o tsv)
+            echo "Method 2: MS Graph token"
+            ENHANCED_TOKEN=$(az account get-access-token --resource-type ms-graph --query accessToken -o tsv 2>/dev/null || echo "")
           fi
+
+          if [ -z "$ENHANCED_TOKEN" ]; then
+            echo "Method 3: Default Azure management token"
+            ENHANCED_TOKEN=$(az account get-access-token --query accessToken -o tsv 2>/dev/null || echo "")
+          fi
+
+          if [ -z "$ENHANCED_TOKEN" ]; then
+            echo "Method 4: Checking for federated token file"
+            if [ -n "$AZURE_FEDERATED_TOKEN_FILE" ] && [ -f "$AZURE_FEDERATED_TOKEN_FILE" ]; then
+              echo "Found federated token file: $AZURE_FEDERATED_TOKEN_FILE"
+              ENHANCED_TOKEN=$(cat "$AZURE_FEDERATED_TOKEN_FILE")
+              echo "Using federated credential token directly"
+            fi
+          fi
+
+          if [ -z "$ENHANCED_TOKEN" ]; then
+            echo "All methods failed to get enhanced token"
+            exit 1
+          fi
+
+          echo "Successfully obtained token using one of the methods"
 
           echo "Enhanced OIDC token captured for debugging"
           echo "$ENHANCED_TOKEN" > jwt-token.txt
 
           echo "=== JWT Token Analysis ==="
-          # Decode JWT header and payload for analysis
+          # Save token parts for analysis
+          echo "$ENHANCED_TOKEN" | cut -d'.' -f1 > /tmp/header.b64
+          echo "$ENHANCED_TOKEN" | cut -d'.' -f2 > /tmp/payload.b64
+
+          echo "Token length: ${#ENHANCED_TOKEN} characters"
+          echo "Token parts: $(echo "$ENHANCED_TOKEN" | tr '.' '\n' | wc -l) parts"
+
+          # Decode JWT header and payload for analysis with proper padding
           echo "Token Header:"
-          echo "$ENHANCED_TOKEN" | cut -d'.' -f1 | base64 -d 2>/dev/null | jq '.' || echo "Failed to decode header"
+          cat /tmp/header.b64 | python3 -c "
+import base64, sys, json
+data = sys.stdin.read().strip()
+# Add padding if needed
+data += '=' * (-len(data) % 4)
+try:
+    decoded = base64.b64decode(data)
+    parsed = json.loads(decoded)
+    print(json.dumps(parsed, indent=2))
+except Exception as e:
+    print(f'Failed to decode header: {e}')
+"
 
           echo "Token Payload:"
-          echo "$ENHANCED_TOKEN" | cut -d'.' -f2 | base64 -d 2>/dev/null | jq '.' || echo "Failed to decode payload"
+          cat /tmp/payload.b64 | python3 -c "
+import base64, sys, json
+data = sys.stdin.read().strip()
+# Add padding if needed
+data += '=' * (-len(data) % 4)
+try:
+    decoded = base64.b64decode(data)
+    parsed = json.loads(decoded)
+    print(json.dumps(parsed, indent=2))
+except Exception as e:
+    print(f'Failed to decode payload: {e}')
+" > /tmp/payload.json
 
-          # Extract key claims for validation
-          ISSUER=$(echo "$ENHANCED_TOKEN" | cut -d'.' -f2 | base64 -d 2>/dev/null | jq -r '.iss')
-          AUDIENCE=$(echo "$ENHANCED_TOKEN" | cut -d'.' -f2 | base64 -d 2>/dev/null | jq -r '.aud')
-          SUBJECT=$(echo "$ENHANCED_TOKEN" | cut -d'.' -f2 | base64 -d 2>/dev/null | jq -r '.sub // "N/A"')
-          EXPIRES=$(echo "$ENHANCED_TOKEN" | cut -d'.' -f2 | base64 -d 2>/dev/null | jq -r '.exp')
+          # Extract key claims for validation using Python
+          ISSUER=$(python3 -c "
+import json
+try:
+    with open('/tmp/payload.json', 'r') as f:
+        data = json.load(f)
+    print(data.get('iss', 'N/A'))
+except: print('N/A')
+")
+          AUDIENCE=$(python3 -c "
+import json
+try:
+    with open('/tmp/payload.json', 'r') as f:
+        data = json.load(f)
+    print(data.get('aud', 'N/A'))
+except: print('N/A')
+")
+          SUBJECT=$(python3 -c "
+import json
+try:
+    with open('/tmp/payload.json', 'r') as f:
+        data = json.load(f)
+    print(data.get('sub', 'N/A'))
+except: print('N/A')
+")
+          EXPIRES=$(python3 -c "
+import json
+try:
+    with open('/tmp/payload.json', 'r') as f:
+        data = json.load(f)
+    print(data.get('exp', 'N/A'))
+except: print('N/A')
+")
 
           echo "Key Claims Analysis:"
           echo "  Issuer: $ISSUER"

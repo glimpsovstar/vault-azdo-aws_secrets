@@ -41,134 +41,22 @@ jobs:
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
-          echo "Getting enhanced OIDC token via Azure Service Connection..."
-          echo "Service Principal Details:"
-          echo "  ARM_CLIENT_ID: ${ARM_CLIENT_ID:-Not set}"
-          echo "  ARM_TENANT_ID: ${ARM_TENANT_ID:-Not set}"
-          echo "  ARM_SUBSCRIPTION_ID: ${ARM_SUBSCRIPTION_ID:-Not set}"
-          echo "  ARM_USE_OIDC: ${ARM_USE_OIDC:-Not set}"
-          echo "  AZURE_FEDERATED_TOKEN_FILE: ${AZURE_FEDERATED_TOKEN_FILE:-Not set}"
+          echo "Getting Azure token via Service Connection..."
 
-          # Try different approaches to get enhanced token
-          echo "Attempting multiple token acquisition methods..."
-
-          # Method 1: Try to get Azure DevOps specific token
-          echo "Method 1: Azure DevOps resource token"
-          ENHANCED_TOKEN=$(az account get-access-token --resource 499b84ac-1321-427f-aa17-267ca6975798 --query accessToken -o tsv 2>/dev/null || echo "")
+          # Get token using az CLI
+          ENHANCED_TOKEN=$(az account get-access-token --query accessToken -o tsv)
 
           if [ -z "$ENHANCED_TOKEN" ]; then
-            echo "Method 2: MS Graph token"
-            ENHANCED_TOKEN=$(az account get-access-token --resource-type ms-graph --query accessToken -o tsv 2>/dev/null || echo "")
-          fi
-
-          if [ -z "$ENHANCED_TOKEN" ]; then
-            echo "Method 3: Default Azure management token"
-            ENHANCED_TOKEN=$(az account get-access-token --query accessToken -o tsv 2>/dev/null || echo "")
-          fi
-
-          if [ -z "$ENHANCED_TOKEN" ]; then
-            echo "Method 4: Checking for federated token file"
-            if [ -n "$AZURE_FEDERATED_TOKEN_FILE" ] && [ -f "$AZURE_FEDERATED_TOKEN_FILE" ]; then
-              echo "Found federated token file: $AZURE_FEDERATED_TOKEN_FILE"
-              ENHANCED_TOKEN=$(cat "$AZURE_FEDERATED_TOKEN_FILE")
-              echo "Using federated credential token directly"
-            fi
-          fi
-
-          if [ -z "$ENHANCED_TOKEN" ]; then
-            echo "All methods failed to get enhanced token"
+            echo "Failed to get token"
             exit 1
           fi
 
-          echo "Successfully obtained token using one of the methods"
-
-          echo "Enhanced OIDC token captured for debugging"
+          echo "Token captured successfully"
           echo "$ENHANCED_TOKEN" > jwt-token.txt
 
-          echo "=== JWT Token Analysis ==="
           echo "Token length: ${#ENHANCED_TOKEN} characters"
-          echo "Token parts: $(echo "$ENHANCED_TOKEN" | tr '.' '\n' | wc -l) parts"
 
-          # Create a Python script for JWT decoding and extract claims to files
-          cat > /tmp/decode_jwt.py << 'EOF'
-import base64, sys, json
-
-def decode_jwt_part(data):
-    data += '=' * (-len(data) % 4)
-    try:
-        decoded = base64.b64decode(data)
-        return json.loads(decoded)
-    except Exception as e:
-        return {"error": str(e)}
-
-token = sys.argv[1] if len(sys.argv) > 1 else ""
-parts = token.split('.')
-
-if len(parts) >= 2:
-    header = decode_jwt_part(parts[0])
-    payload = decode_jwt_part(parts[1])
-
-    print("Token Header:")
-    print(json.dumps(header, indent=2))
-    print("\nToken Payload:")
-    print(json.dumps(payload, indent=2))
-
-    issuer = payload.get('iss', 'N/A')
-    audience = payload.get('aud', 'N/A')
-    subject = payload.get('sub', 'N/A')
-    expires = payload.get('exp', 'N/A')
-
-    print(f"\nIssuer: {issuer}")
-    print(f"Audience: {audience}")
-    print(f"Subject: {subject}")
-    print(f"Expires: {expires}")
-
-    # Write claims to individual files for shell access
-    with open('/tmp/issuer.txt', 'w') as f: f.write(issuer)
-    with open('/tmp/audience.txt', 'w') as f: f.write(audience)
-    with open('/tmp/subject.txt', 'w') as f: f.write(subject)
-    with open('/tmp/expires.txt', 'w') as f: f.write(str(expires))
-else:
-    print("Invalid JWT format")
-    # Write defaults
-    with open('/tmp/issuer.txt', 'w') as f: f.write('N/A')
-    with open('/tmp/audience.txt', 'w') as f: f.write('N/A')
-    with open('/tmp/subject.txt', 'w') as f: f.write('N/A')
-    with open('/tmp/expires.txt', 'w') as f: f.write('N/A')
-EOF
-
-          # Decode the JWT token
-          python3 /tmp/decode_jwt.py "$ENHANCED_TOKEN"
-
-          # Read claims from files
-          ISSUER=$(cat /tmp/issuer.txt)
-          AUDIENCE=$(cat /tmp/audience.txt)
-          SUBJECT=$(cat /tmp/subject.txt)
-          EXPIRES=$(cat /tmp/expires.txt)
-
-          echo "Key Claims Analysis:"
-          echo "  Issuer: $ISSUER"
-          echo "  Audience: $AUDIENCE"
-          echo "  Subject: $SUBJECT"
-          echo "  Expires: $EXPIRES ($(date -r $EXPIRES 2>/dev/null || echo 'Invalid timestamp'))"
-
-          # Check if this is an enhanced WIF token
-          if [[ "$AUDIENCE" == *"vso:"* ]]; then
-            echo "✅ Enhanced WIF token detected (contains Azure DevOps organization ID)"
-          else
-            echo "⚠️  Basic token detected (no organization ID in audience)"
-          fi
-
-          echo "=== Vault Configuration Update Test ==="
-          # Test updating Vault configuration to accept new organization tokens
-          echo "Attempting to update Vault JWT auth configuration..."
-
-          # Try to update the JWT auth configuration for the new organization
-          vault write auth/azure-devops/config \
-            oidc_discovery_url="https://vstoken.dev.azure.com/00000000-0000-0000-0000-000000000000" \
-            bound_audiences="$AUDIENCE" || echo "Failed to update Vault config - will try authentication with current config"
-
-          echo "Authenticating with Vault using enhanced OIDC token..."
+          echo "Authenticating with Vault using token..."
 
           # Authenticate with Vault using enhanced Azure OIDC token
           VAULT_TOKEN=$(vault write -field=token auth/azure-devops/login \

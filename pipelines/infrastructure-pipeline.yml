@@ -42,19 +42,51 @@ jobs:
         scriptLocation: 'inlineScript'
         inlineScript: |
           echo "Getting Azure token via Service Connection..."
+          echo "Available environment variables:"
+          env | grep -E "(ARM_|AZURE_|SYSTEM_)" | sort
 
-          # Get token using az CLI
-          ENHANCED_TOKEN=$(az account get-access-token --query accessToken -o tsv)
+          # Method 1: Try using the System.AccessToken directly (Azure DevOps JWT)
+          if [ -n "$SYSTEM_ACCESSTOKEN" ]; then
+            echo "Found SYSTEM_ACCESSTOKEN, trying as Azure DevOps JWT..."
+            ENHANCED_TOKEN="$SYSTEM_ACCESSTOKEN"
+            echo "Using System.AccessToken: ${#ENHANCED_TOKEN} characters"
+          elif [ -n "$AZURE_FEDERATED_TOKEN_FILE" ] && [ -f "$AZURE_FEDERATED_TOKEN_FILE" ]; then
+            echo "Found federated token file: $AZURE_FEDERATED_TOKEN_FILE"
+            ENHANCED_TOKEN=$(cat "$AZURE_FEDERATED_TOKEN_FILE")
+            echo "Using federated token: ${#ENHANCED_TOKEN} characters"
+          else
+            echo "Trying az CLI access token..."
+            ENHANCED_TOKEN=$(az account get-access-token --query accessToken -o tsv)
+            echo "Using az CLI token: ${#ENHANCED_TOKEN} characters"
+          fi
 
           if [ -z "$ENHANCED_TOKEN" ]; then
-            echo "Failed to get token"
+            echo "Failed to get any token"
             exit 1
           fi
 
           echo "Token captured successfully"
           echo "$ENHANCED_TOKEN" > jwt-token.txt
 
-          echo "Token length: ${#ENHANCED_TOKEN} characters"
+          # Decode token to understand what we have
+          echo "=== Token Analysis ==="
+          echo "Token starts with: ${ENHANCED_TOKEN:0:50}..."
+
+          # Try to decode the JWT payload
+          payload=$(echo "$ENHANCED_TOKEN" | cut -d'.' -f2)
+          padded_payload="${payload}$(printf '%*s' $(( (4 - ${#payload} % 4) % 4 )) | tr ' ' '=')"
+
+          echo "Decoded payload:"
+          echo "$padded_payload" | base64 -d 2>/dev/null | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    print('Issuer:', data.get('iss', 'N/A'))
+    print('Audience:', data.get('aud', 'N/A'))
+    print('Subject:', data.get('sub', 'N/A'))
+except:
+    print('Failed to decode payload')
+"
 
           echo "Authenticating with Vault using token..."
 
@@ -74,6 +106,7 @@ jobs:
       env:
         VAULT_ADDR: $(VAULT_ADDR)
         VAULT_NAMESPACE: $(VAULT_NAMESPACE)
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
 
     - task: Bash@3
       displayName: 'Get AWS Credentials from Vault'

@@ -89,12 +89,11 @@ jobs:
           echo "Token length: ${#ENHANCED_TOKEN} characters"
           echo "Token parts: $(echo "$ENHANCED_TOKEN" | tr '.' '\n' | wc -l) parts"
 
-          # Create a Python script for JWT decoding
-          cat > /tmp/decode_jwt.py << 'PYTHON_EOF'
+          # Create a Python script for JWT decoding and extract claims to files
+          cat > /tmp/decode_jwt.py << 'EOF'
 import base64, sys, json
 
 def decode_jwt_part(data):
-    # Add padding if needed
     data += '=' * (-len(data) % 4)
     try:
         decoded = base64.b64decode(data)
@@ -102,7 +101,6 @@ def decode_jwt_part(data):
     except Exception as e:
         return {"error": str(e)}
 
-# Read token from argument
 token = sys.argv[1] if len(sys.argv) > 1 else ""
 parts = token.split('.')
 
@@ -115,55 +113,38 @@ if len(parts) >= 2:
     print("\nToken Payload:")
     print(json.dumps(payload, indent=2))
 
-    # Extract key claims
-    print(f"\nIssuer: {payload.get('iss', 'N/A')}")
-    print(f"Audience: {payload.get('aud', 'N/A')}")
-    print(f"Subject: {payload.get('sub', 'N/A')}")
-    print(f"Expires: {payload.get('exp', 'N/A')}")
+    issuer = payload.get('iss', 'N/A')
+    audience = payload.get('aud', 'N/A')
+    subject = payload.get('sub', 'N/A')
+    expires = payload.get('exp', 'N/A')
 
-    # Save for later use
-    with open('/tmp/jwt_claims.json', 'w') as f:
-        json.dump(payload, f)
+    print(f"\nIssuer: {issuer}")
+    print(f"Audience: {audience}")
+    print(f"Subject: {subject}")
+    print(f"Expires: {expires}")
+
+    # Write claims to individual files for shell access
+    with open('/tmp/issuer.txt', 'w') as f: f.write(issuer)
+    with open('/tmp/audience.txt', 'w') as f: f.write(audience)
+    with open('/tmp/subject.txt', 'w') as f: f.write(subject)
+    with open('/tmp/expires.txt', 'w') as f: f.write(str(expires))
 else:
     print("Invalid JWT format")
-PYTHON_EOF
+    # Write defaults
+    with open('/tmp/issuer.txt', 'w') as f: f.write('N/A')
+    with open('/tmp/audience.txt', 'w') as f: f.write('N/A')
+    with open('/tmp/subject.txt', 'w') as f: f.write('N/A')
+    with open('/tmp/expires.txt', 'w') as f: f.write('N/A')
+EOF
 
           # Decode the JWT token
           python3 /tmp/decode_jwt.py "$ENHANCED_TOKEN"
 
-          # Extract claims for shell variables
-          ISSUER=$(python3 -c "
-import json
-try:
-    with open('/tmp/jwt_claims.json', 'r') as f:
-        data = json.load(f)
-    print(data.get('iss', 'N/A'))
-except: print('N/A')
-")
-          AUDIENCE=$(python3 -c "
-import json
-try:
-    with open('/tmp/jwt_claims.json', 'r') as f:
-        data = json.load(f)
-    print(data.get('aud', 'N/A'))
-except: print('N/A')
-")
-          SUBJECT=$(python3 -c "
-import json
-try:
-    with open('/tmp/jwt_claims.json', 'r') as f:
-        data = json.load(f)
-    print(data.get('sub', 'N/A'))
-except: print('N/A')
-")
-          EXPIRES=$(python3 -c "
-import json
-try:
-    with open('/tmp/jwt_claims.json', 'r') as f:
-        data = json.load(f)
-    print(data.get('exp', 'N/A'))
-except: print('N/A')
-")
+          # Read claims from files
+          ISSUER=$(cat /tmp/issuer.txt)
+          AUDIENCE=$(cat /tmp/audience.txt)
+          SUBJECT=$(cat /tmp/subject.txt)
+          EXPIRES=$(cat /tmp/expires.txt)
 
           echo "Key Claims Analysis:"
           echo "  Issuer: $ISSUER"

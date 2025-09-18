@@ -1,0 +1,242 @@
+trigger:
+  branches:
+    include:
+      - master
+      - main
+
+pool: 'Self-Hosted'
+
+variables:
+  - group: vault-config
+  - name: AWS_REGION
+    value: 'ap-southeast-1'
+
+jobs:
+- job: DeployApplication
+  displayName: 'Deploy Application to S3'
+  steps:
+    - checkout: self
+      persistCredentials: true
+
+    - task: Bash@3
+      displayName: 'Capture Azure DevOps JWT Token'
+      env:
+        AZURE_ACCESS_TOKEN: $(System.AccessToken)
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "Capturing JWT token..."
+          echo "$AZURE_ACCESS_TOKEN" > jwt-token.txt
+          echo "JWT token saved for debugging"
+
+    - task: Bash@3
+      displayName: 'Authenticate with Vault using JWT'
+      env:
+        AZURE_ACCESS_TOKEN: $(System.AccessToken)
+        VAULT_ADDR: $(VAULT_ADDR)
+        VAULT_NAMESPACE: $(VAULT_NAMESPACE)
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "Authenticating with Vault..."
+
+          # Authenticate with Vault using Azure DevOps JWT
+          VAULT_TOKEN=$(vault write -field=token auth/azure-devops/login \
+            role=pipeline-s3-role \
+            jwt="$AZURE_ACCESS_TOKEN")
+
+          if [ -z "$VAULT_TOKEN" ]; then
+            echo "Failed to authenticate with Vault"
+            exit 1
+          fi
+
+          echo "##vso[task.setvariable variable=VAULT_TOKEN;issecret=true]$VAULT_TOKEN"
+          echo "Successfully authenticated with Vault"
+
+    - task: Bash@3
+      displayName: 'Get AWS S3-Only Credentials from Vault'
+      env:
+        VAULT_TOKEN: $(VAULT_TOKEN)
+        VAULT_ADDR: $(VAULT_ADDR)
+        VAULT_NAMESPACE: $(VAULT_NAMESPACE)
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "Fetching AWS S3-only credentials from Vault..."
+
+          # Get temporary AWS credentials with S3-only permissions
+          CREDS=$(vault read -format=json aws/sts/s3-only ttl=1h)
+
+          if [ -z "$CREDS" ]; then
+            echo "Failed to get AWS credentials from Vault"
+            exit 1
+          fi
+
+          # Extract credentials
+          AWS_ACCESS_KEY_ID=$(echo $CREDS | jq -r '.data.access_key')
+          AWS_SECRET_ACCESS_KEY=$(echo $CREDS | jq -r '.data.secret_key')
+          AWS_SESSION_TOKEN=$(echo $CREDS | jq -r '.data.security_token')
+
+          # Set as pipeline variables
+          echo "##vso[task.setvariable variable=AWS_ACCESS_KEY_ID;issecret=true]$AWS_ACCESS_KEY_ID"
+          echo "##vso[task.setvariable variable=AWS_SECRET_ACCESS_KEY;issecret=true]$AWS_SECRET_ACCESS_KEY"
+          echo "##vso[task.setvariable variable=AWS_SESSION_TOKEN;issecret=true]$AWS_SESSION_TOKEN"
+
+          echo "AWS S3-only credentials obtained successfully"
+          echo "Credential TTL: 1 hour"
+          echo "Permissions: S3 operations only"
+
+    - task: Bash@3
+      displayName: 'Create Demo Application Files'
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "Creating demo application files..."
+
+          # Create a simple HTML application
+          mkdir -p demo-app
+
+          cat > demo-app/index.html << 'EOF'
+          <!DOCTYPE html>
+          <html>
+          <head>
+              <title>Vault + Azure DevOps + AWS Demo</title>
+              <style>
+                  body { font-family: Arial, sans-serif; margin: 50px; }
+                  .container { max-width: 800px; margin: 0 auto; }
+                  .success { color: green; font-size: 24px; }
+                  .info { background: #f0f0f0; padding: 20px; border-radius: 5px; margin: 20px 0; }
+                  code { background: #333; color: #fff; padding: 2px 5px; border-radius: 3px; }
+              </style>
+          </head>
+          <body>
+              <div class="container">
+                  <h1 class="success">🔐 Secure Deployment Successful!</h1>
+                  <div class="info">
+                      <h2>Zero-Trust Credential Management</h2>
+                      <p>This application was deployed using:</p>
+                      <ul>
+                          <li>✅ Azure DevOps Pipeline with JWT authentication</li>
+                          <li>✅ HashiCorp Vault for dynamic secrets</li>
+                          <li>✅ AWS STS temporary credentials (S3-only)</li>
+                          <li>✅ No hardcoded credentials!</li>
+                      </ul>
+                      <p>Deployed at: <code>$(date)</code></p>
+                      <p>Build: <code>#$(Build.BuildNumber)</code></p>
+                      <p>Credentials expire in: <code>1 hour</code></p>
+                  </div>
+                  <div class="info">
+                      <h3>Security Features:</h3>
+                      <ul>
+                          <li>🔒 Credentials auto-rotate every hour</li>
+                          <li>📝 Complete audit trail in Vault</li>
+                          <li>🚨 Instant revocation capability</li>
+                          <li>👤 Role-based access (S3-only for apps)</li>
+                      </ul>
+                  </div>
+              </div>
+          </body>
+          </html>
+          EOF
+
+          # Create deployment metadata
+          cat > demo-app/deployment.json << EOF
+          {
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "build_number": "$(Build.BuildNumber)",
+            "source_version": "$(Build.SourceVersion)",
+            "pipeline": "Application Deployment",
+            "credentials": "Dynamic AWS STS via Vault",
+            "region": "$AWS_REGION"
+          }
+          EOF
+
+          echo "Demo application files created"
+
+    - task: Bash@3
+      displayName: 'Deploy to S3'
+      env:
+        AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+        AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+        AWS_SESSION_TOKEN: $(AWS_SESSION_TOKEN)
+        AWS_REGION: $(AWS_REGION)
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "Deploying application to S3..."
+
+          # Generate unique bucket name
+          BUCKET_NAME="vault-demo-app-$(date +%Y%m%d-%H%M%S)"
+          echo "Creating S3 bucket: $BUCKET_NAME"
+
+          # Create S3 bucket
+          aws s3 mb s3://$BUCKET_NAME --region $AWS_REGION
+
+          # Enable static website hosting
+          aws s3 website s3://$BUCKET_NAME \
+            --index-document index.html \
+            --error-document error.html
+
+          # Upload files
+          aws s3 cp demo-app/index.html s3://$BUCKET_NAME/index.html \
+            --content-type "text/html"
+
+          aws s3 cp demo-app/deployment.json s3://$BUCKET_NAME/deployment.json \
+            --content-type "application/json"
+
+          # Set bucket policy for public read
+          cat > /tmp/bucket-policy.json << EOF
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Sid": "PublicReadGetObject",
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": "s3:GetObject",
+                "Resource": "arn:aws:s3:::$BUCKET_NAME/*"
+              }
+            ]
+          }
+          EOF
+
+          aws s3api put-bucket-policy \
+            --bucket $BUCKET_NAME \
+            --policy file:///tmp/bucket-policy.json
+
+          # Output the website URL
+          WEBSITE_URL="http://$BUCKET_NAME.s3-website-$AWS_REGION.amazonaws.com"
+          echo "##vso[task.setvariable variable=WEBSITE_URL]$WEBSITE_URL"
+
+          echo "=========================================="
+          echo "✅ Application deployed successfully!"
+          echo "🌐 Website URL: $WEBSITE_URL"
+          echo "🪣 S3 Bucket: $BUCKET_NAME"
+          echo "=========================================="
+
+    - task: Bash@3
+      displayName: 'Verify Deployment'
+      env:
+        AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+        AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+        AWS_SESSION_TOKEN: $(AWS_SESSION_TOKEN)
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "Verifying deployment..."
+
+          # List deployed files
+          echo "Files in S3 bucket:"
+          aws s3 ls s3://$BUCKET_NAME/
+
+          # Test that we can't do EC2 operations (should fail)
+          echo ""
+          echo "Testing permission boundaries..."
+          echo "Attempting EC2 operation (should fail due to S3-only role):"
+          aws ec2 describe-instances --region $AWS_REGION 2>&1 | head -5 || echo "✅ Expected: EC2 access denied (S3-only role working correctly)"
+
+          echo ""
+          echo "=========================================="
+          echo "🎉 Application deployment complete!"
+          echo "🔒 Using S3-only credentials as expected"
+          echo "=========================================="

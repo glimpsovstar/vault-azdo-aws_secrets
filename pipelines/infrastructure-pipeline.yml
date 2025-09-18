@@ -43,12 +43,12 @@ jobs:
         inlineScript: |
           echo "Getting Azure token via Service Connection..."
           echo "Available environment variables:"
-          env | grep -E "(ARM_|AZURE_|SYSTEM_)" | sort
+          env | grep "ARM_\|AZURE_\|SYSTEM_" | sort
 
           # Get Azure Management token for Azure auth method
           echo "Getting Azure Management token for Vault Azure auth..."
           ENHANCED_TOKEN=$(az account get-access-token --query accessToken -o tsv)
-          echo "Using Azure Management token: ${#ENHANCED_TOKEN} characters"
+          echo "Using Azure Management token from az CLI"
 
           if [ -z "$ENHANCED_TOKEN" ]; then
             echo "Failed to get any token"
@@ -60,8 +60,7 @@ jobs:
 
           # Simple token validation
           echo "=== Token Analysis ==="
-          echo "Token starts with: ${ENHANCED_TOKEN:0:50}..."
-          echo "Token length: ${#ENHANCED_TOKEN} characters"
+          echo "Token captured successfully for Vault authentication"
 
           echo "Authenticating with Vault using token..."
 

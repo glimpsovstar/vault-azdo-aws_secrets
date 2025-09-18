@@ -45,20 +45,10 @@ jobs:
           echo "Available environment variables:"
           env | grep -E "(ARM_|AZURE_|SYSTEM_)" | sort
 
-          # Method 1: Try using the System.AccessToken directly (Azure DevOps JWT)
-          if [ -n "$SYSTEM_ACCESSTOKEN" ]; then
-            echo "Found SYSTEM_ACCESSTOKEN, trying as Azure DevOps JWT..."
-            ENHANCED_TOKEN="$SYSTEM_ACCESSTOKEN"
-            echo "Using System.AccessToken: ${#ENHANCED_TOKEN} characters"
-          elif [ -n "$AZURE_FEDERATED_TOKEN_FILE" ] && [ -f "$AZURE_FEDERATED_TOKEN_FILE" ]; then
-            echo "Found federated token file: $AZURE_FEDERATED_TOKEN_FILE"
-            ENHANCED_TOKEN=$(cat "$AZURE_FEDERATED_TOKEN_FILE")
-            echo "Using federated token: ${#ENHANCED_TOKEN} characters"
-          else
-            echo "Trying az CLI access token..."
-            ENHANCED_TOKEN=$(az account get-access-token --query accessToken -o tsv)
-            echo "Using az CLI token: ${#ENHANCED_TOKEN} characters"
-          fi
+          # Get Azure Management token for Azure auth method
+          echo "Getting Azure Management token for Vault Azure auth..."
+          ENHANCED_TOKEN=$(az account get-access-token --query accessToken -o tsv)
+          echo "Using Azure Management token: ${#ENHANCED_TOKEN} characters"
 
           if [ -z "$ENHANCED_TOKEN" ]; then
             echo "Failed to get any token"
@@ -68,30 +58,15 @@ jobs:
           echo "Token captured successfully"
           echo "$ENHANCED_TOKEN" > jwt-token.txt
 
-          # Decode token to understand what we have
+          # Simple token validation
           echo "=== Token Analysis ==="
           echo "Token starts with: ${ENHANCED_TOKEN:0:50}..."
-
-          # Try to decode the JWT payload
-          payload=$(echo "$ENHANCED_TOKEN" | cut -d'.' -f2)
-          padded_payload="${payload}$(printf '%*s' $(( (4 - ${#payload} % 4) % 4 )) | tr ' ' '=')"
-
-          echo "Decoded payload:"
-          echo "$padded_payload" | base64 -d 2>/dev/null | python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    print('Issuer:', data.get('iss', 'N/A'))
-    print('Audience:', data.get('aud', 'N/A'))
-    print('Subject:', data.get('sub', 'N/A'))
-except:
-    print('Failed to decode payload')
-"
+          echo "Token length: ${#ENHANCED_TOKEN} characters"
 
           echo "Authenticating with Vault using token..."
 
-          # Authenticate with Vault using enhanced Azure OIDC token
-          VAULT_TOKEN=$(vault write -field=token auth/azure-devops/login \
+          # Authenticate with Vault using Azure auth method
+          VAULT_TOKEN=$(vault write -field=token auth/ado/login \
             role=pipeline-infra-role \
             jwt="$ENHANCED_TOKEN")
 
@@ -101,7 +76,7 @@ except:
           fi
 
           echo "##vso[task.setvariable variable=VAULT_TOKEN;issecret=true]$VAULT_TOKEN"
-          echo "Successfully authenticated with Vault using enhanced WIF token"
+          echo "Successfully authenticated with Vault using Azure auth method"
         addSpnToEnvironment: true
       env:
         VAULT_ADDR: $(VAULT_ADDR)

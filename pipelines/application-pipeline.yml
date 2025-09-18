@@ -4,7 +4,7 @@ trigger:
       - master
       - main
 
-pool: 'Self-Hosted'
+pool: 'Default'
 
 variables:
   - group: vault-config
